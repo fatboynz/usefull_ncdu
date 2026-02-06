@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""
+dirdu.py — list subdirectories by size (ncdu-lite) and optionally delete by number.
+
+Usage:
+  python3 dirdu.py /path/to/scan
+  python3 dirdu.py /path/to/scan --dry-run
+"""
+
+from __future__ import annotations
+import argparse
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Iterable, List, Set, Tuple
+
+def human(n: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    f = float(n)
+    for u in units:
+        if f < 1024.0 or u == units[-1]:
+            return f"{f:,.1f} {u}" if u != "B" else f"{int(f)} {u}"
+        f /= 1024.0
+    return f"{f:,.1f} PiB"
+
+def dir_size_bytes(root: Path) -> int:
+    total = 0
+    # walk without following symlinks
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        # optionally skip symlinked dirs encountered by walk
+        dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink()]
+        for fn in filenames:
+            p = Path(dirpath) / fn
+            try:
+                if p.is_symlink():
+                    continue
+                total += p.stat().st_size
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+    return total
+
+def list_subdirs_by_size(base: Path) -> List[Tuple[Path, int]]:
+    items: List[Tuple[Path, int]] = []
+    try:
+        with os.scandir(base) as it:
+            for entry in it:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                p = Path(entry.path)
+                try:
+                    sz = dir_size_bytes(p)
+                except Exception:
+                    sz = 0
+                items.append((p, sz))
+    except (PermissionError, FileNotFoundError) as e:
+        print(f"Error scanning {base}: {e}", file=sys.stderr)
+        sys.exit(2)
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items
+
+def parse_selection(sel: str, max_index: int) -> Set[int]:
+    sel = sel.strip()
+    if not sel:
+        return set()
+    out: Set[int] = set()
+    parts = [p.strip() for p in sel.replace(",", " ").split()]
+    for part in parts:
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a_i, b_i = int(a), int(b)
+            lo, hi = (a_i, b_i) if a_i <= b_i else (b_i, a_i)
+            for i in range(lo, hi + 1):
+                if 1 <= i <= max_index:
+                    out.add(i)
+        else:
+            i = int(part)
+            if 1 <= i <= max_index:
+                out.add(i)
+    return out
+
+def print_table(items: List[Tuple[Path, int]], base: Path) -> None:
+    print(f"\nDirectories under: {base}\n")
+    if not items:
+        print("(no subdirectories found)")
+        return
+    w = len(str(len(items)))
+    for idx, (p, sz) in enumerate(items, 1):
+        rel = p.name
+        print(f"{idx:>{w}}) {human(sz):>12}  {rel}")
+    total = sum(sz for _, sz in items)
+    print(f"\nTotal (listed dirs): {human(total)}")
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path", nargs="?", default=".", help="directory to scan (lists immediate subdirs)")
+    ap.add_argument("--dry-run", action="store_true", help="show what would be deleted, don’t delete")
+    args = ap.parse_args()
+
+    base = Path(args.path).expanduser().resolve()
+    if not base.is_dir():
+        print(f"Not a directory: {base}", file=sys.stderr)
+        return 2
+
+    items = list_subdirs_by_size(base)
+    print_table(items, base)
+    if not items:
+        return 0
+
+    while True:
+        sel = input("\nSelect directories to delete by number (e.g. 1 3-5), or Enter to quit: ").strip()
+        if not sel:
+            return 0
+
+        picks = sorted(parse_selection(sel, len(items)))
+        if not picks:
+            print("No valid selections.")
+            continue
+
+        to_delete = [(i, items[i - 1][0], items[i - 1][1]) for i in picks]
+        bytes_sum = sum(sz for _, _, sz in to_delete)
+
+        print("\nWill delete:")
+        for i, p, sz in to_delete:
+            print(f"  {i}) {human(sz):>12}  {p}")
+        print(f"\nSelected total: {human(bytes_sum)}")
+
+        if args.dry_run:
+            print("\n--dry-run set; nothing deleted.")
+            continue
+
+        confirm = input("\nType DELETE to confirm: ").strip()
+        if confirm != "DELETE":
+            print("Cancelled.")
+            continue
+
+        for _, p, _ in to_delete:
+            try:
+                shutil.rmtree(p)
+                print(f"Deleted: {p}")
+            except Exception as e:
+                print(f"Failed to delete {p}: {e}", file=sys.stderr)
+
+        # Refresh list after deletion
+        items = list_subdirs_by_size(base)
+        print_table(items, base)
+
+if __name__ == "__main__":
+    raise SystemExit(main())
